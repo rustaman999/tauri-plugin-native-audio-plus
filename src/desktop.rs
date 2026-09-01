@@ -348,8 +348,15 @@ fn build_sink(
     path: &PathBuf,
     rate: f32,
 ) -> Result<(Sink, f64), String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let decoder = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+    eprintln!("[native-audio] build_sink path={:?} rate={}", path, rate);
+    let file = File::open(path).map_err(|e| {
+        eprintln!("[native-audio] open failed: {}", e);
+        e.to_string()
+    })?;
+    let decoder = Decoder::new(BufReader::new(file)).map_err(|e| {
+        eprintln!("[native-audio] decoder failed: {}", e);
+        e.to_string()
+    })?;
     // duration estimate: total_duration() if available - guard NaN/Inf
     let raw_duration = decoder.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let duration = if raw_duration.is_finite() && raw_duration >= 0.0 {
@@ -357,13 +364,18 @@ fn build_sink(
     } else {
         0.0
     };
+    eprintln!("[native-audio] decoder ok duration={}", duration);
     if !rate.is_finite() || rate <= 0.0 || rate > 16.0 {
         return Err(format!("invalid rate {rate}"));
     }
-    let sink = Sink::try_new(handle).map_err(|e| e.to_string())?;
+    let sink = Sink::try_new(handle).map_err(|e| {
+        eprintln!("[native-audio] Sink::try_new failed: {}", e);
+        e.to_string()
+    })?;
     sink.set_speed(rate);
     sink.append(decoder);
     sink.pause(); // start paused, play() will resume
+    eprintln!("[native-audio] sink created, empty={}", sink.empty());
     Ok((sink, duration))
 }
 
@@ -371,10 +383,19 @@ fn build_sink(
 
 #[tauri::command]
 pub fn initialize<R: Runtime>(app: AppHandle<R>) -> NativeAudioState {
+    eprintln!("[native-audio] initialize");
     let arc = inner();
     let mut g = arc.lock();
-    g.state.last_error = None;
+    g.ensure_stream();
+    if g.handle.is_none() {
+        eprintln!("[native-audio] initialize: no audio device!");
+        g.state.last_error = Some("no audio device".into());
+    } else {
+        eprintln!("[native-audio] initialize: device ok");
+        g.state.last_error = None;
+    }
     let s = g.snapshot();
+    eprintln!("[native-audio] initialize -> {:?}", s);
     emit_state(&app, s.clone());
     s
 }
@@ -388,11 +409,16 @@ pub fn set_source<R: Runtime>(
     artist: Option<String>,
     artwork_url: Option<String>,
 ) -> Result<NativeAudioState, String> {
+    eprintln!("[native-audio] set_source src={} id={:?}", src, id);
     let _ = (title, artist, artwork_url); // metadata not used on desktop yet (could integrate with muda)
     if src.trim().is_empty() {
         return Err("src is required".into());
     }
-    let path = resolve_src(&src, &app)?;
+    let path = resolve_src(&src, &app).map_err(|e| {
+        eprintln!("[native-audio] resolve_src failed: {}", e);
+        e
+    })?;
+    eprintln!("[native-audio] resolve_src -> {:?}", path);
     let arc = inner();
     let mut g = arc.lock();
     let rate = g.state.rate as f32;
@@ -415,10 +441,12 @@ pub fn set_source<R: Runtime>(
 
     match build_sink(&handle, &path, rate) {
         Ok((sink, duration)) => {
+            eprintln!("[native-audio] set_source ok duration={}", duration);
             g.duration = duration;
             g.sink = Some(sink);
         }
         Err(e) => {
+            eprintln!("[native-audio] set_source build_sink failed: {}", e);
             g.state.last_error = Some(e.clone());
             let s = g.snapshot();
             emit_state(&app, s.clone());
@@ -426,17 +454,27 @@ pub fn set_source<R: Runtime>(
         }
     }
     let s = g.snapshot();
+    eprintln!("[native-audio] set_source -> {:?}", s);
     emit_state(&app, s.clone());
     Ok(s)
 }
 
 #[tauri::command]
 pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
+    eprintln!("[native-audio] play");
     let arc = inner();
     let mut g = arc.lock();
     if g.sink.is_none() {
+        eprintln!("[native-audio] play: no source set");
         return Err("no source set".into());
     }
+    eprintln!(
+        "[native-audio] play: sink empty={} paused={} duration={} stable={}",
+        g.sink.as_ref().map(|s| s.empty()).unwrap_or(true),
+        g.sink.as_ref().map(|s| s.is_paused()).unwrap_or(true),
+        g.duration,
+        g.state.stable_time
+    );
     if g.state.did_reach_end {
         // seek to 0
         if let Some(sink) = &g.sink {
@@ -520,6 +558,7 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
     });
 
     let s = g.snapshot();
+    eprintln!("[native-audio] play -> {:?}", s);
     // throttled persist handled in poll thread, but also emit
     emit_state(&app, s.clone());
     Ok(s)
@@ -527,6 +566,7 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
 
 #[tauri::command]
 pub fn pause<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
+    eprintln!("[native-audio] pause");
     let arc = inner();
     let mut g = arc.lock();
     if let Some(sink) = &g.sink {
