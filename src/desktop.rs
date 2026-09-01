@@ -64,7 +64,7 @@ impl DesktopInner {
         // rodio Sink doesn't expose duration/position directly for generic sources
         // we track duration on set_source and currentTime via sink position approximation
         // For file sources we can query, for now use state
-        let buffering = false;
+        let buffering = self.state.buffering;
         let has_error = self.state.last_error.is_some();
         let ended = self.state.did_reach_end;
 
@@ -105,6 +105,7 @@ struct PlaybackStateMachine {
     pending_seek: Option<f64>,
     stable_time: f64,
     desired_playing: bool,
+    buffering: bool,
 }
 
 impl Default for PlaybackStateMachine {
@@ -117,6 +118,7 @@ impl Default for PlaybackStateMachine {
             pending_seek: None,
             stable_time: 0.0,
             desired_playing: false,
+            buffering: false,
         }
     }
 }
@@ -466,18 +468,23 @@ pub fn set_source<R: Runtime>(
         g.state.did_reach_end = false;
         g.state.last_error = None;
         g.state.desired_playing = false;
+        g.state.buffering = true;
         g.duration = 0.0;
         let s = g.snapshot();
+        eprintln!("[native-audio] set_source: cached - buffering=true");
         emit_state(&app, s);
     } else {
-        eprintln!("[native-audio] set_source: not cached - keep old playing during download");
-        // не стопаем старый, только обновим мета для логов
+        eprintln!("[native-audio] set_source: not cached - keep old playing during download, buffering=true");
+        // не стопаем старый, только обновим мета и покажем buffering
         let mut g = arc.lock();
         g.current_src = Some(src.clone());
         g.state.current_id = match id {
             Some(v) if v > 0 => Some(v),
             _ => None,
         };
+        g.state.buffering = true;
+        let s = g.snapshot();
+        emit_state(&app, s);
     }
 
     // качаем/резолвим без удержания lock
@@ -494,6 +501,7 @@ pub fn set_source<R: Runtime>(
         g.state.stable_time = 0.0;
         g.state.did_reach_end = false;
         g.state.desired_playing = false;
+        g.state.buffering = false;
         g.duration = 0.0;
         let s = g.snapshot();
         emit_state(&app, s);
@@ -512,6 +520,7 @@ pub fn set_source<R: Runtime>(
         g.state.did_reach_end = false;
         g.state.last_error = None;
         g.state.desired_playing = false;
+        // buffering остается true пока не создадим sink
         g.duration = 0.0;
     }
     let rate = g.state.rate as f32;
@@ -523,10 +532,12 @@ pub fn set_source<R: Runtime>(
             eprintln!("[native-audio] set_source ok duration={}", duration);
             g.duration = duration;
             g.sink = Some(sink);
+            g.state.buffering = false;
         }
         Err(e) => {
             eprintln!("[native-audio] set_source build_sink failed: {}", e);
             g.state.last_error = Some(e.clone());
+            g.state.buffering = false;
             let s = g.snapshot();
             emit_state(&app, s.clone());
             return Err(e);
