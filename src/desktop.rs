@@ -191,6 +191,17 @@ fn write_checkpoint<R: Runtime>(
     }
 }
 
+fn safe_duration(secs: f64) -> Result<std::time::Duration, String> {
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(format!("invalid duration: {secs}"));
+    }
+    // rodio/cpal panics if secs is NaN or too big (Duration::MAX ~ 584 years)
+    // clamp to 24h to be safe - no audio is longer
+    let clamped = secs.min(86400.0 * 7.0);
+    // Duration::from_secs_f64 still checks is_finite, so safe now
+    Ok(std::time::Duration::from_secs_f64(clamped))
+}
+
 fn emit_state<R: Runtime>(app: &AppHandle<R>, state: NativeAudioState) {
     let _ = app.emit("native_audio_state", &state);
     // also plugin event for addPluginListener compatibility
@@ -304,11 +315,16 @@ fn build_sink(
 ) -> Result<(Sink, f64), String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let decoder = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
-    // duration estimate: total_duration() if available
-    let duration = decoder
-        .total_duration()
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    // duration estimate: total_duration() if available - guard NaN/Inf
+    let raw_duration = decoder.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let duration = if raw_duration.is_finite() && raw_duration >= 0.0 {
+        raw_duration.min(86400.0 * 7.0)
+    } else {
+        0.0
+    };
+    if !rate.is_finite() || rate <= 0.0 || rate > 16.0 {
+        return Err(format!("invalid rate {rate}"));
+    }
     let sink = Sink::try_new(handle).map_err(|e| e.to_string())?;
     sink.set_speed(rate);
     sink.append(decoder);
@@ -398,11 +414,19 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
     if let Some(sink) = g.sink.as_ref() {
         sink.play();
         if let Some(target) = pending {
-            let _ = sink.try_seek(std::time::Duration::from_secs_f64(target.max(0.0)));
-            g.state.stable_time = target;
+            if let Ok(d) = safe_duration(target.max(0.0)) {
+                let _ = sink.try_seek(d);
+            }
+            if target.is_finite() && target >= 0.0 {
+                g.state.stable_time = target.min(86400.0 * 7.0);
+            } else {
+                g.state.stable_time = 0.0;
+            }
         }
     } else if let Some(target) = pending {
-        g.state.stable_time = target;
+        if target.is_finite() && target >= 0.0 {
+            g.state.stable_time = target.min(86400.0 * 7.0);
+        }
     }
     g.state.desired_playing = true;
     g.state.last_error = None;
@@ -421,8 +445,14 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
                 // update stable_time from sink position approximation
                 // rodio sink doesn't give position, so we increment manually when playing
                 if !empty && g.state.desired_playing {
-                    g.state.stable_time += 0.2;
-                    if g.duration > 0.0 && g.state.stable_time >= g.duration {
+                    if !g.state.stable_time.is_finite() {
+                        g.state.stable_time = 0.0;
+                    }
+                    g.state.stable_time = (g.state.stable_time + 0.2).min(86400.0 * 7.0);
+                    if g.duration.is_finite()
+                        && g.duration > 0.0
+                        && g.state.stable_time >= g.duration
+                    {
                         g.state.stable_time = g.duration;
                         g.state.did_reach_end = true;
                         g.state.desired_playing = false;
@@ -480,18 +510,21 @@ pub fn seek_to<R: Runtime>(app: AppHandle<R>, position: f64) -> Result<NativeAud
     if !position.is_finite() {
         return Err("position is required".into());
     }
-    let target = position.max(0.0);
+    let target_raw = position.max(0.0);
+    // clamp target to safe range before any Duration conversion
+    let target = if target_raw.is_finite() {
+        target_raw.min(86400.0 * 7.0)
+    } else {
+        return Err("position is required".into());
+    };
+    let dur = safe_duration(target).map_err(|e| e.to_string())?;
     let arc = inner();
     let mut g = arc.lock();
     if g.sink.is_none() {
         return Err("no source set".into());
     }
     let should_resume = g.state.desired_playing;
-    let seek_res = g
-        .sink
-        .as_ref()
-        .unwrap()
-        .try_seek(std::time::Duration::from_secs_f64(target));
+    let seek_res = g.sink.as_ref().unwrap().try_seek(dur);
     if seek_res.is_err() {
         g.state.pending_seek = Some(target);
         g.state.stable_time = target;
