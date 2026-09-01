@@ -1,9 +1,10 @@
 use crate::models::{NativeAudioProgressCheckpoint, NativeAudioState};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -24,10 +25,22 @@ struct DesktopInner {
     state: PlaybackStateMachine,
     current_src: Option<String>,
     duration: f64,
+    // async build signalling: set_source builds sink on a bg thread; play() waits on this
+    build_signal: Option<Arc<BuildSignal>>,
     // checkpoint file throttling
     last_persist_ms: u128,
     last_persist_time: f64,
     last_persist_id: Option<i64>,
+}
+
+struct BuildSignal {
+    lock: Mutex<State>,
+    cond: Condvar,
+}
+enum State {
+    Idle,
+    Building,
+    Ready(Result<(f64, Sink), String>),
 }
 
 impl DesktopInner {
@@ -36,13 +49,14 @@ impl DesktopInner {
             _stream: None,
             handle: None,
             sink: None,
-            state: PlaybackStateMachine::default(),
-            current_src: None,
-            duration: 0.0,
-            last_persist_ms: 0,
-            last_persist_time: f64::NAN,
-            last_persist_id: None,
-        }
+        state: PlaybackStateMachine::default(),
+        current_src: None,
+        duration: 0.0,
+        build_signal: None,
+        last_persist_ms: 0,
+        last_persist_time: f64::NAN,
+        last_persist_id: None,
+    }
     }
 
     fn ensure_stream(&mut self) {
@@ -141,6 +155,70 @@ fn inner() -> Arc<Mutex<DesktopInner>> {
     INNER
         .get_or_init(|| Arc::new(Mutex::new(DesktopInner::new())))
         .clone()
+}
+
+// A single persistent progress ticker, started lazily. Mirrors Android/iOS:
+// foreground 25ms / background 250ms idea - on desktop we keep 200ms but
+// stop advancing when desired_playing is false. Also fixes tick counter bug
+// (previously tick was reset to 0 each iteration).
+static TICKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn ensure_ticker<R: Runtime>(app: &AppHandle<R>) {
+    if TICKER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app_clone = app.clone();
+    let inner_clone = inner();
+    std::thread::spawn(move || {
+        let mut tick: u64 = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // only emit when there is a sink (playing, paused or ended) - mirrors Android ticker
+            let (empty, playing, did_end) = {
+                let mut g = inner_clone.lock();
+                if g.sink.is_none() {
+                    continue;
+                }
+                let empty = g.sink.as_ref().map(|s| s.empty()).unwrap_or(true);
+                // advance time only when actually playing
+                if !empty && g.state.desired_playing && !g.state.did_reach_end {
+                    if !g.state.stable_time.is_finite() {
+                        g.state.stable_time = 0.0;
+                    }
+                    g.state.stable_time = (g.state.stable_time + 0.2).min(86400.0 * 7.0);
+                    if g.duration.is_finite() && g.duration > 0.0 && g.state.stable_time >= g.duration
+                    {
+                        g.state.stable_time = g.duration;
+                        g.state.did_reach_end = true;
+                        g.state.desired_playing = false;
+                        g.state.buffering = false;
+                    }
+                }
+                tick += 1;
+                let s2 = g.snapshot();
+                if tick % 5 == 0 {
+                    eprintln!(
+                        "[native-audio] tick {} -> time={:.1}/{:.1} playing={} buffering={} empty={}",
+                        tick, s2.current_time, s2.duration, s2.is_playing, s2.buffering, empty
+                    );
+                }
+                write_checkpoint(&app_clone, &mut g, &s2, s2.status == "ended");
+                emit_state(&app_clone, s2.clone());
+                (empty, s2.is_playing, s2.status == "ended")
+            };
+            // reached end: ensure did_reach_end is latched so UI shows paused state
+            if empty && !playing && !did_end {
+                let mut g = inner_clone.lock();
+                if !g.state.did_reach_end && g.state.desired_playing {
+                    g.state.did_reach_end = true;
+                    g.state.desired_playing = false;
+                    let s = g.snapshot();
+                    write_checkpoint(&app_clone, &mut g, &s, true);
+                    emit_state(&app_clone, s);
+                }
+            }
+        }
+    });
 }
 
 fn now_ms() -> u128 {
@@ -434,28 +512,13 @@ pub fn set_source<R: Runtime>(
         return Err("src is required".into());
     }
     let arc = inner();
-    // проверяем кэш заранее: если http уже закэширован - стопаем сразу (мгновенно), если нет - старый доигрывает пока качаем (без тишины)
-    let is_cached = if src.trim().starts_with("http") {
-        let url = src.trim();
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(url.as_bytes());
-        let hash = hex::encode(h.finalize());
-        // пробуем оба ext (mp3/ogg) - достаточно проверить mp3 как fallback
-        let cache_dir = dirs::cache_dir()
-            .or_else(|| app.path().app_cache_dir().ok())
-            .unwrap_or_else(|| std::env::temp_dir().join("tauri-native-audio"));
-        let p1 = cache_dir.join(format!("{hash}.mp3"));
-        let p2 = cache_dir.join(format!("{hash}.ogg"));
-        p1.exists() || p2.exists()
-    } else {
-        true // локальный файл - мгновенно
-    };
 
-    if is_cached {
+    // stop previous immediately so the old track never lingers, then reset state
+    // and surface a sustained "loading" (buffering) until the new source is ready.
+    {
         let mut g = arc.lock();
         if let Some(old) = g.sink.take() {
-            eprintln!("[native-audio] set_source: cached - stopping previous immediately");
+            eprintln!("[native-audio] set_source: stopping previous immediately");
             old.stop();
         }
         g.current_src = Some(src.clone());
@@ -470,82 +533,64 @@ pub fn set_source<R: Runtime>(
         g.state.desired_playing = false;
         g.state.buffering = true;
         g.duration = 0.0;
+
+        let signal = Arc::new(BuildSignal {
+            lock: Mutex::new(State::Building),
+            cond: Condvar::new(),
+        });
+        g.build_signal = Some(signal.clone());
+
         let s = g.snapshot();
-        eprintln!("[native-audio] set_source: cached - buffering=true");
-        emit_state(&app, s);
-    } else {
-        eprintln!("[native-audio] set_source: not cached - keep old playing during download, buffering=true");
-        // не стопаем старый, только обновим мета и покажем buffering
-        let mut g = arc.lock();
-        g.current_src = Some(src.clone());
-        g.state.current_id = match id {
-            Some(v) if v > 0 => Some(v),
-            _ => None,
-        };
-        g.state.buffering = true;
-        let s = g.snapshot();
+        eprintln!("[native-audio] set_source: buffering=true -> {:?}", s);
         emit_state(&app, s);
     }
 
-    // качаем/резолвим без удержания lock
-    let path = resolve_src(&src, &app).map_err(|e| {
-        eprintln!("[native-audio] resolve_src failed: {}", e);
-        let mut g = arc.lock();
-        // если держали старый - теперь стопаем и показываем ошибку
-        if !is_cached {
-            if let Some(old) = g.sink.take() {
-                old.stop();
+    // Build sink (and download if needed) on a background thread so the UI keeps
+    // receiving the sustained "loading" state, then take ownership of the result.
+    let app_clone = app.clone();
+    let arc_clone = arc.clone();
+    let src_clone = src;
+    std::thread::spawn(move || {
+        let result = resolve_src(&src_clone, &app_clone).and_then(|path| {
+            {
+                let mut g = arc_clone.lock();
+                g.ensure_stream();
+                if g.handle.is_none() {
+                    return Err("no audio device".into());
+                }
             }
+            let handle = {
+                let g = arc_clone.lock();
+                let rate = g.state.rate as f32;
+                let handle = g.handle.clone().ok_or("no audio device")?;
+                (handle, rate)
+            };
+            build_sink(&handle.0, &path, handle.1)
+        });
+        let app_for_err = app_clone.clone();
+        let arc_for_err = arc_clone.clone();
+        let signal_for_err = { arc_clone.lock().build_signal.clone() };
+        let completed = match result {
+            Ok((sink, duration)) => Ok((duration, sink)),
+            Err(e) => {
+                eprintln!("[native-audio] build failed: {}", e);
+                let mut g = arc_for_err.lock();
+                g.state.last_error = Some(e.clone());
+                g.state.buffering = false;
+                let s = g.snapshot();
+                emit_state(&app_for_err, s);
+                Err(e)
+            }
+        };
+        if let Some(signal) = signal_for_err {
+            let mut st = signal.lock.lock();
+            *st = State::Ready(completed);
+            signal.cond.notify_all();
         }
-        g.state.last_error = Some(e.clone());
-        g.state.stable_time = 0.0;
-        g.state.did_reach_end = false;
-        g.state.desired_playing = false;
-        g.state.buffering = false;
-        g.duration = 0.0;
-        let s = g.snapshot();
-        emit_state(&app, s);
-        e
-    })?;
-    eprintln!("[native-audio] resolve_src -> {:?}", path);
-    let mut g = arc.lock();
-    // если не кэширован - теперь стопаем старый перед созданием нового
-    if !is_cached {
-        if let Some(old) = g.sink.take() {
-            eprintln!("[native-audio] set_source: download done - now stopping old");
-            old.stop();
-        }
-        g.state.stable_time = 0.0;
-        g.state.pending_seek = None;
-        g.state.did_reach_end = false;
-        g.state.last_error = None;
-        g.state.desired_playing = false;
-        // buffering остается true пока не создадим sink
-        g.duration = 0.0;
-    }
-    let rate = g.state.rate as f32;
-    g.ensure_stream();
-    let handle = g.handle.clone().ok_or("no audio device")?;
+    });
 
-    match build_sink(&handle, &path, rate) {
-        Ok((sink, duration)) => {
-            eprintln!("[native-audio] set_source ok duration={}", duration);
-            g.duration = duration;
-            g.sink = Some(sink);
-            g.state.buffering = false;
-        }
-        Err(e) => {
-            eprintln!("[native-audio] set_source build_sink failed: {}", e);
-            g.state.last_error = Some(e.clone());
-            g.state.buffering = false;
-            let s = g.snapshot();
-            emit_state(&app, s.clone());
-            return Err(e);
-        }
-    }
+    let mut g = arc.lock();
     let s = g.snapshot();
-    eprintln!("[native-audio] set_source -> {:?}", s);
-    emit_state(&app, s.clone());
     Ok(s)
 }
 
@@ -554,8 +599,58 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
     eprintln!("[native-audio] play");
     let arc = inner();
     let mut g = arc.lock();
+
+    // If a build is in flight, wait for it so we never race the background thread.
+    let pending = g.build_signal.take();
     if g.sink.is_none() {
-        eprintln!("[native-audio] play: no source set");
+        if let Some(signal) = pending {
+            let deadline = SystemTime::now() + std::time::Duration::from_secs(40);
+            let mut st = signal.lock.lock();
+            loop {
+                if matches!(&*st, State::Ready(_)) || matches!(&*st, State::Idle) {
+                    break;
+                }
+                let now = SystemTime::now();
+                if now >= deadline {
+                    break;
+                }
+                match deadline.duration_since(now) {
+                    Ok(wait) => {
+                        signal.cond.wait_for(&mut st, wait);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let res = if matches!(&*st, State::Ready(_)) {
+                match std::mem::replace(&mut *st, State::Idle) {
+                    State::Ready(r) => Some(r),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            drop(st);
+            if let Some(res) = res {
+                match res {
+                    Ok((dur, sink)) => {
+                        g.state.last_error = None;
+                        g.state.buffering = false;
+                        g.duration = dur;
+                        g.sink = Some(sink);
+                    }
+                    Err(e) => {
+                        g.state.last_error = Some(e.clone());
+                        let s = g.snapshot();
+                        emit_state(&app, s);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    if g.sink.is_none() {
+        eprintln!("[native-audio] play: no source set / not ready");
         return Err("no source set".into());
     }
     eprintln!(
@@ -594,69 +689,12 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
     g.state.desired_playing = true;
     g.state.last_error = None;
 
-    // poll ended in background - эмулируем timeupdate как на html5 (200ms)
-    let app_clone = app.clone();
-    let inner_clone = arc.clone();
-    std::thread::spawn(move || {
-        // simple ended detection: poll until empty
-        let mut tick: u64 = 0;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            tick += 1;
-            let (empty, _id, _time) = {
-                let mut g = inner_clone.lock();
-                let empty = g.sink.as_ref().map(|s| s.empty()).unwrap_or(true);
-                // update stable_time from sink position approximation
-                // rodio sink doesn't give position, so we increment manually when playing
-                if !empty && g.state.desired_playing {
-                    if !g.state.stable_time.is_finite() {
-                        g.state.stable_time = 0.0;
-                    }
-                    g.state.stable_time = (g.state.stable_time + 0.2).min(86400.0 * 7.0);
-                    if g.duration.is_finite()
-                        && g.duration > 0.0
-                        && g.state.stable_time >= g.duration
-                    {
-                        g.state.stable_time = g.duration;
-                        g.state.did_reach_end = true;
-                        g.state.desired_playing = false;
-                    }
-                }
-                let s2 = g.snapshot();
-                if tick % 5 == 0 {
-                    eprintln!(
-                        "[native-audio] tick {} -> time={:.1}/{:.1} playing={} empty={}",
-                        tick, s2.current_time, s2.duration, s2.is_playing, empty
-                    );
-                }
-                write_checkpoint(&app_clone, &mut g, &s2, s2.status == "ended");
-                emit_state(&app_clone, s2.clone());
-                (empty, g.state.current_id, g.state.stable_time)
-            };
-            if empty {
-                let mut g = inner_clone.lock();
-                if !g.state.did_reach_end && g.state.desired_playing {
-                    g.state.did_reach_end = true;
-                    g.state.desired_playing = false;
-                    let s = g.snapshot();
-                    write_checkpoint(&app_clone, &mut g, &s, true);
-                    emit_state(&app_clone, s);
-                }
-                break;
-            }
-            // stop polling if paused/disposed
-            {
-                let g = inner_clone.lock();
-                if !g.state.desired_playing {
-                    break;
-                }
-            }
-        }
-    });
+    // start the single persistent ticker (idempotent)
+    ensure_ticker(&app);
 
     let s = g.snapshot();
     eprintln!("[native-audio] play -> {:?}", s);
-    // throttled persist handled in poll thread, but also emit
+    // throttled persist handled in ticker thread, but also emit
     emit_state(&app, s.clone());
     Ok(s)
 }
@@ -778,6 +816,7 @@ pub fn dispose<R: Runtime>(app: AppHandle<R>) {
     }
     g.duration = 0.0;
     g.current_src = None;
+    g.build_signal = None;
     g.state.reset();
     g.state.stable_time = 0.0;
     emit_state(&app, g.snapshot());
