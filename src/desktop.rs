@@ -431,12 +431,29 @@ pub fn set_source<R: Runtime>(
     if src.trim().is_empty() {
         return Err("src is required".into());
     }
-    // мгновенно стопаем старый трек чтобы не доигрывал во время буферизации нового (как на android/ios)
     let arc = inner();
-    {
+    // проверяем кэш заранее: если http уже закэширован - стопаем сразу (мгновенно), если нет - старый доигрывает пока качаем (без тишины)
+    let is_cached = if src.trim().starts_with("http") {
+        let url = src.trim();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(url.as_bytes());
+        let hash = hex::encode(h.finalize());
+        // пробуем оба ext (mp3/ogg) - достаточно проверить mp3 как fallback
+        let cache_dir = dirs::cache_dir()
+            .or_else(|| app.path().app_cache_dir().ok())
+            .unwrap_or_else(|| std::env::temp_dir().join("tauri-native-audio"));
+        let p1 = cache_dir.join(format!("{hash}.mp3"));
+        let p2 = cache_dir.join(format!("{hash}.ogg"));
+        p1.exists() || p2.exists()
+    } else {
+        true // локальный файл - мгновенно
+    };
+
+    if is_cached {
         let mut g = arc.lock();
         if let Some(old) = g.sink.take() {
-            eprintln!("[native-audio] set_source: stopping previous sink");
+            eprintln!("[native-audio] set_source: cached - stopping previous immediately");
             old.stop();
         }
         g.current_src = Some(src.clone());
@@ -450,22 +467,53 @@ pub fn set_source<R: Runtime>(
         g.state.last_error = None;
         g.state.desired_playing = false;
         g.duration = 0.0;
-        // сразу эмитим idle/loading чтобы фронт показал буферизацию
         let s = g.snapshot();
-        eprintln!("[native-audio] set_source: stopped old, now loading");
         emit_state(&app, s);
+    } else {
+        eprintln!("[native-audio] set_source: not cached - keep old playing during download");
+        // не стопаем старый, только обновим мета для логов
+        let mut g = arc.lock();
+        g.current_src = Some(src.clone());
+        g.state.current_id = match id {
+            Some(v) if v > 0 => Some(v),
+            _ => None,
+        };
     }
-    // теперь качаем/резолвим новый src без удержания lock (не блокируем play/pause)
+
+    // качаем/резолвим без удержания lock
     let path = resolve_src(&src, &app).map_err(|e| {
         eprintln!("[native-audio] resolve_src failed: {}", e);
         let mut g = arc.lock();
+        // если держали старый - теперь стопаем и показываем ошибку
+        if !is_cached {
+            if let Some(old) = g.sink.take() {
+                old.stop();
+            }
+        }
         g.state.last_error = Some(e.clone());
+        g.state.stable_time = 0.0;
+        g.state.did_reach_end = false;
+        g.state.desired_playing = false;
+        g.duration = 0.0;
         let s = g.snapshot();
         emit_state(&app, s);
         e
     })?;
     eprintln!("[native-audio] resolve_src -> {:?}", path);
     let mut g = arc.lock();
+    // если не кэширован - теперь стопаем старый перед созданием нового
+    if !is_cached {
+        if let Some(old) = g.sink.take() {
+            eprintln!("[native-audio] set_source: download done - now stopping old");
+            old.stop();
+        }
+        g.state.stable_time = 0.0;
+        g.state.pending_seek = None;
+        g.state.did_reach_end = false;
+        g.state.last_error = None;
+        g.state.desired_playing = false;
+        g.duration = 0.0;
+    }
     let rate = g.state.rate as f32;
     g.ensure_stream();
     let handle = g.handle.clone().ok_or("no audio device")?;
