@@ -1,16 +1,16 @@
 [package]
-name = "tauri-plugin-native-audio"
+name = "tauri-plugin-native-audio-plus"
 version = "1.0.5"
 edition = "2021"
 rust-version = "1.77.2"
 build = "build.rs"
 links = "tauri-plugin-native-audio"
-description = "Native mobile audio playback plugin for Tauri"
+description = "Native audio playback plugin for Tauri - unified API for Android/iOS/Desktop (rodio + http streaming)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/uvarov-frontend/tauri-plugin-native-audio"
-homepage = "https://github.com/uvarov-frontend/tauri-plugin-native-audio"
-documentation = "https://docs.rs/tauri-plugin-native-audio"
-keywords = ["tauri", "plugin", "audio", "media", "mobile"]
+repository = "https://github.com/rustaman999/tauri-plugin-native-audio-plus"
+homepage = "https://github.com/rustaman999/tauri-plugin-native-audio-plus"
+documentation = "https://docs.rs/tauri-plugin-native-audio-plus"
+keywords = ["tauri", "plugin", "audio", "media", "mobile", "desktop", "rodio"]
 categories = ["multimedia::audio"]
 
 [lib]

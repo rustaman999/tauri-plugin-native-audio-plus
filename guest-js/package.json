@@ -1,7 +1,7 @@
 {
-  "name": "tauri-plugin-native-audio-api",
+  "name": "tauri-plugin-native-audio-plus-api",
   "version": "1.0.5",
-  "description": "JavaScript API for tauri-plugin-native-audio",
+  "description": "JavaScript API for tauri-plugin-native-audio-plus (unified Android/iOS/Desktop)",
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "files": [
@@ -12,13 +12,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/uvarov-frontend/tauri-plugin-native-audio.git",
+    "url": "git+https://github.com/rustaman999/tauri-plugin-native-audio-plus.git",
     "directory": "guest-js"
   },
   "bugs": {
-    "url": "https://github.com/uvarov-frontend/tauri-plugin-native-audio/issues"
+    "url": "https://github.com/rustaman999/tauri-plugin-native-audio-plus/issues"
   },
-  "homepage": "https://github.com/uvarov-frontend/tauri-plugin-native-audio",
+  "homepage": "https://github.com/rustaman999/tauri-plugin-native-audio-plus",
   "keywords": [
     "tauri",
     "tauri-plugin",

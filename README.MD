@@ -1,19 +1,20 @@
-# tauri-plugin-native-audio
+# tauri-plugin-native-audio-plus
 
-Native mobile audio playback for Tauri applications.
+Unified native audio playback for Tauri applications (fork with desktop support).
 
-`tauri-plugin-native-audio` gives you one JavaScript API over native playback engines:
+`tauri-plugin-native-audio-plus` gives you one JavaScript API over native playback engines:
 
 - Android: Media3 ExoPlayer + MediaSessionService + notification controls
 - iOS: AVPlayer + MPNowPlayingInfoCenter + MPRemoteCommandCenter
+- Desktop (Linux/Windows/macOS): rodio + cpal + http progressive streaming (24h cache, HLS/DASH rejected)
 
-It is designed for real mobile playback flows: background-friendly behavior, lock screen / notification controls, and continuous state synchronization in the frontend.
+It is designed for real mobile + desktop playback flows: background-friendly behavior, lock screen / notification controls, and continuous state synchronization in the frontend.
 
 | Platform | Supported |
 | -------- | --------- |
-| Linux    | -         |
-| Windows  | -         |
-| macOS    | -         |
+| Linux    | ✓ (rodio/ALSA-Pulse) |
+| Windows  | ✓ (rodio/WASAPI) |
+| macOS    | ✓ (rodio/CoreAudio) |
 | Android  | ✓         |
 | iOS      | ✓         |
 
@@ -31,19 +32,21 @@ Install the core plugin in `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-native-audio = "1"
+tauri-plugin-native-audio-plus = "1"
 # or from Git:
-tauri-plugin-native-audio = { git = "https://github.com/uvarov-frontend/tauri-plugin-native-audio", tag = "v1.0.5" }
+tauri-plugin-native-audio-plus = { git = "https://github.com/rustaman999/tauri-plugin-native-audio-plus", tag = "v1.0.5" }
+# alias if you keep original import:
+# tauri-plugin-native-audio = { package = "tauri-plugin-native-audio-plus", version = "1" }
 ```
 
 Install the JavaScript guest bindings:
 
 ```sh
-pnpm add tauri-plugin-native-audio-api
+pnpm add tauri-plugin-native-audio-plus-api
 # or
-npm add tauri-plugin-native-audio-api
+npm add tauri-plugin-native-audio-plus-api
 # or
-yarn add tauri-plugin-native-audio-api
+yarn add tauri-plugin-native-audio-plus-api
 ```
 
 ## Setting up
@@ -143,7 +146,7 @@ import {
   getProgressCheckpoint,
   dispose,
   addStateListener
-} from "tauri-plugin-native-audio-api";
+} from "tauri-plugin-native-audio-plus-api";
 
 const unlisten = await addStateListener((state) => {
   console.log("native-audio state", state);
