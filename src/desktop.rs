@@ -226,11 +226,70 @@ fn resolve_src(src: &str, app: &AppHandle<impl Runtime>) -> Result<PathBuf, Stri
     if p.exists() {
         return Ok(p);
     }
-    // remote https:// - download to temp
+    // remote https:// - stream via http download to cache (like Android ExoPlayer does for progressive)
     if s.starts_with("http://") || s.starts_with("https://") {
-        return Err("remote URL not supported on desktop yet, use local file path or file://".into());
+        // HLS/DASH not supported by rodio - reject early with clear message
+        if s.contains(".m3u8") || s.contains(".mpd") {
+            return Err("HLS/DASH (.m3u8/.mpd) not supported on desktop rodio backend, use progressive mp3/mp4/ogg/wav".into());
+        }
+        return download_to_cache(s, app);
     }
     Err(format!("file not found: {}", s))
+}
+
+fn download_to_cache<R: Runtime>(url: &str, app: &AppHandle<R>) -> Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    let ext = url
+        .split('?')
+        .next()
+        .unwrap_or(url)
+        .rsplit('.')
+        .next()
+        .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| format!(".{}", e))
+        .unwrap_or_else(|| ".bin".to_string());
+
+    let cache_dir = dirs::cache_dir()
+        .or_else(|| app.path().app_cache_dir().ok())
+        .unwrap_or_else(|| std::env::temp_dir().join("tauri-native-audio"));
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cached_path = cache_dir.join(format!("{hash}{ext}"));
+
+    // reuse if already cached and < 24h
+    if let Ok(meta) = std::fs::metadata(&cached_path) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                if elapsed.as_secs() < 24 * 3600 && meta.len() > 0 {
+                    return Ok(cached_path);
+                }
+            }
+        }
+    }
+
+    // download (blocking) - with timeout 30s
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| format!("http fetch failed: {e}"))?;
+
+    if resp.status() != 200 {
+        return Err(format!("http status {}", resp.status()));
+    }
+
+    let mut reader = resp.into_reader();
+    let mut tmp = cached_path.clone();
+    tmp.set_extension("tmp");
+    let mut file = File::create(&tmp).map_err(|e| e.to_string())?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    let _ = std::fs::rename(&tmp, &cached_path);
+    Ok(cached_path)
 }
 
 fn build_sink(
