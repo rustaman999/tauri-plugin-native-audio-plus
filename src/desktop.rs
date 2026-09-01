@@ -14,6 +14,8 @@ struct SendOutputStream(OutputStream);
 unsafe impl Send for SendOutputStream {}
 unsafe impl Sync for SendOutputStream {}
 
+//
+
 // Keep OutputStream alive globally - it must outlive Sink
 struct DesktopInner {
     _stream: Option<SendOutputStream>,
@@ -212,7 +214,10 @@ fn resolve_src(src: &str, app: &AppHandle<impl Runtime>) -> Result<PathBuf, Stri
             if let Some(slash) = after.find('/') {
                 let path = &after[slash..];
                 // Try app resource dir
-                if let Ok(resolved) = app.path().resolve(path.trim_start_matches('/'), tauri::path::BaseDirectory::Resource) {
+                if let Ok(resolved) = app.path().resolve(
+                    path.trim_start_matches('/'),
+                    tauri::path::BaseDirectory::Resource,
+                ) {
                     if resolved.exists() {
                         return Ok(resolved);
                     }
@@ -228,7 +233,9 @@ fn resolve_src(src: &str, app: &AppHandle<impl Runtime>) -> Result<PathBuf, Stri
     }
     // remote https:// - download to temp
     if s.starts_with("http://") || s.starts_with("https://") {
-        return Err("remote URL not supported on desktop yet, use local file path or file://".into());
+        return Err(
+            "remote URL not supported on desktop yet, use local file path or file://".into(),
+        );
     }
     Err(format!("file not found: {}", s))
 }
@@ -241,7 +248,10 @@ fn build_sink(
     let file = File::open(path).map_err(|e| e.to_string())?;
     let decoder = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
     // duration estimate: total_duration() if available
-    let duration = decoder.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let duration = decoder
+        .total_duration()
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
     let sink = Sink::try_new(handle).map_err(|e| e.to_string())?;
     sink.set_speed(rate);
     sink.append(decoder);
@@ -409,10 +419,7 @@ pub fn pause<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> 
 }
 
 #[tauri::command]
-pub fn seek_to<R: Runtime>(
-    app: AppHandle<R>,
-    position: f64,
-) -> Result<NativeAudioState, String> {
+pub fn seek_to<R: Runtime>(app: AppHandle<R>, position: f64) -> Result<NativeAudioState, String> {
     if !position.is_finite() {
         return Err("position is required".into());
     }
