@@ -213,9 +213,16 @@ fn safe_duration(secs: f64) -> Result<std::time::Duration, String> {
 }
 
 fn emit_state<R: Runtime>(app: &AppHandle<R>, state: NativeAudioState) {
-    let _ = app.emit("native_audio_state", &state);
-    // also plugin event for addPluginListener compatibility
+    // для addPluginListener("native-audio", "native_audio_state", ...) нужен plugin://
     let _ = app.emit("plugin:native-audio://native_audio_state", &state);
+    // fallback для listen("native_audio_state")
+    let _ = app.emit("native_audio_state", &state);
+    if state.is_playing {
+        eprintln!(
+            "[native-audio] emit playing {:.1}/{:.1}",
+            state.current_time, state.duration
+        );
+    }
 }
 
 fn resolve_src(src: &str, app: &AppHandle<impl Runtime>) -> Result<PathBuf, String> {
@@ -528,17 +535,18 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
     g.state.desired_playing = true;
     g.state.last_error = None;
 
-    // poll ended in background
+    // poll ended in background - эмулируем timeupdate как на html5 (200ms)
     let app_clone = app.clone();
     let inner_clone = arc.clone();
     std::thread::spawn(move || {
         // simple ended detection: poll until empty
+        let mut tick: u64 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            let (empty, id, time) = {
+            tick += 1;
+            let (empty, _id, _time) = {
                 let mut g = inner_clone.lock();
                 let empty = g.sink.as_ref().map(|s| s.empty()).unwrap_or(true);
-                let s = g.snapshot();
                 // update stable_time from sink position approximation
                 // rodio sink doesn't give position, so we increment manually when playing
                 if !empty && g.state.desired_playing {
@@ -556,6 +564,12 @@ pub fn play<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> {
                     }
                 }
                 let s2 = g.snapshot();
+                if tick % 5 == 0 {
+                    eprintln!(
+                        "[native-audio] tick {} -> time={:.1}/{:.1} playing={} empty={}",
+                        tick, s2.current_time, s2.duration, s2.is_playing, empty
+                    );
+                }
                 write_checkpoint(&app_clone, &mut g, &s2, s2.status == "ended");
                 emit_state(&app_clone, s2.clone());
                 (empty, g.state.current_id, g.state.stable_time)
