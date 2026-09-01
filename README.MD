@@ -34,7 +34,7 @@ Install the core plugin in `src-tauri/Cargo.toml`:
 [dependencies]
 tauri-plugin-native-audio-plus = "1"
 # or from Git:
-tauri-plugin-native-audio-plus = { git = "https://github.com/rustaman999/tauri-plugin-native-audio-plus", tag = "v1.0.6" }
+tauri-plugin-native-audio-plus = { git = "https://github.com/rustaman999/tauri-plugin-native-audio-plus", tag = "v1.0.7" }
 # alias if you keep original import:
 # tauri-plugin-native-audio = { package = "tauri-plugin-native-audio-plus", version = "1" }
 ```

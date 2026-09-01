@@ -260,15 +260,19 @@ fn download_to_cache<R: Runtime>(url: &str, app: &AppHandle<R>) -> Result<PathBu
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    let ext = url
-        .split('?')
-        .next()
-        .unwrap_or(url)
-        .rsplit('.')
-        .next()
-        .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-        .map(|e| format!(".{}", e))
-        .unwrap_or_else(|| ".bin".to_string());
+    // bandcamp/bcbits often has no extension but is mp3-128 - force mp3
+    let ext = if url.contains("mp3-128") || url.contains("bcbits.com") {
+        ".mp3".to_string()
+    } else {
+        url.split('?')
+            .next()
+            .unwrap_or(url)
+            .rsplit('.')
+            .next()
+            .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .map(|e| format!(".{}", e))
+            .unwrap_or_else(|| ".mp3".to_string())
+    };
 
     let cache_dir = dirs::cache_dir()
         .or_else(|| app.path().app_cache_dir().ok())
