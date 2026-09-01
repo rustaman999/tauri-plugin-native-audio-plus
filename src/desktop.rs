@@ -667,11 +667,21 @@ pub fn pause<R: Runtime>(app: AppHandle<R>) -> Result<NativeAudioState, String> 
     let arc = inner();
     let mut g = arc.lock();
     if let Some(sink) = &g.sink {
+        eprintln!(
+            "[native-audio] pause: empty={} paused={} before",
+            sink.empty(),
+            sink.is_paused()
+        );
         sink.pause();
+        eprintln!("[native-audio] pause: after paused={}", sink.is_paused());
+    } else {
+        eprintln!("[native-audio] pause: no sink");
     }
     g.state.desired_playing = false;
     g.state.pending_seek = None;
+    g.state.buffering = false;
     let s = g.snapshot();
+    eprintln!("[native-audio] pause -> {:?}", s);
     write_checkpoint(&app, &mut g, &s, true);
     emit_state(&app, s.clone());
     Ok(s)
