@@ -260,25 +260,23 @@ fn download_to_cache<R: Runtime>(url: &str, app: &AppHandle<R>) -> Result<PathBu
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    // bandcamp/bcbits often has no extension but is mp3-128 - force mp3
-    let ext = if url.contains("mp3-128") || url.contains("bcbits.com") {
-        ".mp3".to_string()
-    } else {
-        url.split('?')
-            .next()
-            .unwrap_or(url)
-            .rsplit('.')
-            .next()
-            .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-            .map(|e| format!(".{}", e))
-            .unwrap_or_else(|| ".mp3".to_string())
-    };
+    // ext из URL, fallback .mp3 - универсально (не только mp3-128), rodio детектит по содержимому
+    let url_ext = url
+        .split('?')
+        .next()
+        .unwrap_or(url)
+        .rsplit('.')
+        .next()
+        .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| format!(".{}", e.to_lowercase()))
+        .filter(|e| matches!(e.as_str(), ".mp3" | ".ogg" | ".flac" | ".wav" | ".m4a" | ".aac" | ".opus" | ".mp4"))
+        .unwrap_or_else(|| ".mp3".to_string());
 
     let cache_dir = dirs::cache_dir()
         .or_else(|| app.path().app_cache_dir().ok())
         .unwrap_or_else(|| std::env::temp_dir().join("tauri-native-audio"));
     let _ = std::fs::create_dir_all(&cache_dir);
-    let cached_path = cache_dir.join(format!("{hash}{ext}"));
+    let mut cached_path = cache_dir.join(format!("{hash}{url_ext}"));
 
     // reuse if already cached and < 24h
     if let Ok(meta) = std::fs::metadata(&cached_path) {
@@ -299,6 +297,39 @@ fn download_to_cache<R: Runtime>(url: &str, app: &AppHandle<R>) -> Result<PathBu
 
     if resp.status() != 200 {
         return Err(format!("http status {}", resp.status()));
+    }
+
+    // уточнить ext по Content-Type если URL без расширения
+    if url_ext == ".mp3" {
+        if let Some(ct) = resp.header("content-type") {
+            let ct = ct.to_lowercase();
+            let ct_ext = if ct.contains("ogg") || ct.contains("opus") {
+                ".ogg"
+            } else if ct.contains("flac") {
+                ".flac"
+            } else if ct.contains("wav") {
+                ".wav"
+            } else if ct.contains("mp4") || ct.contains("m4a") || ct.contains("aac") {
+                ".m4a"
+            } else {
+                ""
+            };
+            if !ct_ext.is_empty() && ct_ext != url_ext {
+                cached_path = cache_dir.join(format!("{hash}{ct_ext}"));
+                // если уже закэширован с новым ext - вернуть
+                if let Ok(meta) = std::fs::metadata(&cached_path) {
+                    if meta.len() > 0 {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(elapsed) = modified.elapsed() {
+                                if elapsed.as_secs() < 24 * 3600 {
+                                    return Ok(cached_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let mut reader = resp.into_reader();
