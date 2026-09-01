@@ -1,7 +1,7 @@
 {
-  "name": "tauri-plugin-native-audio-plus-api",
+  "name": "tauri-plugin-native-audio-api",
   "version": "1.0.5",
-  "description": "JavaScript API for tauri-plugin-native-audio-plus (unified Android/iOS/Desktop)",
+  "description": "JavaScript API for tauri-plugin-native-audio (unified Android/iOS/Desktop - plus fork)",
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "files": [

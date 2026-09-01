@@ -39,14 +39,15 @@ tauri-plugin-native-audio-plus = { git = "https://github.com/rustaman999/tauri-p
 # tauri-plugin-native-audio = { package = "tauri-plugin-native-audio-plus", version = "1" }
 ```
 
-Install the JavaScript guest bindings:
+Install the JavaScript guest bindings (JS API не менялся, используй оригинальный npm пакет):
 
 ```sh
-pnpm add tauri-plugin-native-audio-plus-api
+pnpm add tauri-plugin-native-audio-api
 # or
-npm add tauri-plugin-native-audio-plus-api
-# or
-yarn add tauri-plugin-native-audio-plus-api
+npm add tauri-plugin-native-audio-api
+# or для plus-форка из git/path:
+# pnpm add file:./guest-js  или  pnpm add github:rustaman999/tauri-plugin-native-audio-plus#main --filter guest-js
+```
 ```
 
 ## Setting up
@@ -146,7 +147,7 @@ import {
   getProgressCheckpoint,
   dispose,
   addStateListener
-} from "tauri-plugin-native-audio-plus-api";
+} from "tauri-plugin-native-audio-api"; // JS API не менялся, один API на все платформы
 
 const unlisten = await addStateListener((state) => {
   console.log("native-audio state", state);
