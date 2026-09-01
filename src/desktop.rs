@@ -97,7 +97,6 @@ impl DesktopInner {
 }
 
 // Simplified port of PlaybackStateMachine from iOS/Swift
-#[derive(Default)]
 struct PlaybackStateMachine {
     rate: f64,
     last_error: Option<String>,
@@ -108,6 +107,20 @@ struct PlaybackStateMachine {
     desired_playing: bool,
 }
 
+impl Default for PlaybackStateMachine {
+    fn default() -> Self {
+        Self {
+            rate: 1.0,
+            last_error: None,
+            did_reach_end: false,
+            current_id: None,
+            pending_seek: None,
+            stable_time: 0.0,
+            desired_playing: false,
+        }
+    }
+}
+
 impl PlaybackStateMachine {
     fn effective_time(&self, is_playing: bool) -> f64 {
         if let Some(target) = self.pending_seek {
@@ -116,10 +129,7 @@ impl PlaybackStateMachine {
         self.stable_time
     }
     fn reset(&mut self) {
-        *self = Self {
-            rate: 1.0,
-            ..Default::default()
-        };
+        *self = Self::default();
     }
 }
 
